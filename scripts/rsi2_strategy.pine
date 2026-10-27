@@ -1,0 +1,95 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org
+// © St0icTrader
+
+//@version=6
+strategy("RSI 2 Prop Strategy", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, process_orders_on_close=true)
+
+// === Group Setup ===
+GRP_MAIN  = "Strategy Parameters"
+GRP_EXIT  = "Take Profit Settings"
+GRP_RISK  = "Risk Management"
+GRP_COSTS = "FTMO CFD Costs Emulation"
+
+// === Inputs ===
+emaLength     = input.int(100, "EMA Entry Filter Length", minval=1, group=GRP_MAIN, tooltip="Price must be above this EMA to allow BUY signals.")
+rsiLength     = input.int(2, "RSI Length", minval=1, group=GRP_MAIN)
+rsiBuyLvl     = input.int(10, "RSI Entry Threshold (Oversold)", minval=1, maxval=50, group=GRP_MAIN)
+
+// === Mutually Exclusive Exit Mode Selector (Dropdown) ===
+exitMode       = input.string("RSI Target", "Exit Strategy Mode", options=["RSI Target", "Trailing EMA Target"], group=GRP_EXIT, tooltip="Choose strictly ONE exit mode. Only the active mode's parameters will apply.")
+rsiSellLvl     = input.int(90, " ↳ RSI Exit Target Level", minval=50, maxval=99, group=GRP_EXIT, tooltip="Exits when RSI reaches or exceeds this level.")
+trailEmaLength = input.int(10, " ↳ Trailing Profit EMA Length", minval=1, group=GRP_EXIT, tooltip="Exits when price crosses down beneath this EMA line.")
+
+// Risk Management Input (3.0% - 4.0% for FTMO Safety)
+stopLossPct   = input.float(3.5, "Stop Loss (%)", minval=0.1, step=0.5, group=GRP_RISK)
+
+// FTMO CFD Costs Inputs
+simSlippage   = input.float(1.0, "Slippage Penalty (Index Points)", minval=0.0, step=0.5, group=GRP_COSTS)
+dailySwapPct  = input.float(0.02, "Daily Long Swap (%)", minval=0.0, step=0.005, group=GRP_COSTS)
+
+// Dynamic Date Filter for Backtesting
+useDateFilter = input.bool(true, "Use Date Range Filter", group=GRP_MAIN)
+startDate     = input.time(timestamp("1 Jan 2023 00:00 +0000"), "Start Date", group=GRP_MAIN)
+endDate       = input.time(timestamp("1 Jan 2030 00:00 +0000"), "End Date", group=GRP_MAIN)
+inDateRange   = not useDateFilter or (time >= startDate and time <= endDate)
+
+// === Indicators ===
+emaVal      = ta.ema(close, emaLength)
+trailEmaVal = ta.ema(close, trailEmaLength)
+rsiVal      = ta.rsi(close, rsiLength)
+
+// === Visual Plotting ===
+plot(emaVal, title="Entry Filter EMA (100)", color=color.blue, linewidth=2)
+// Only plots trailing profit line if the active exit mode matches
+plot(exitMode == "Trailing EMA Target" ? trailEmaVal : na, title="Trailing Profit EMA", color=color.orange, linewidth=1, style=plot.style_linebr)
+
+// === Signal Logic ===
+longCondition  = (strategy.position_size == 0) and (close > emaVal) and (rsiVal <= rsiBuyLvl) and inDateRange
+
+// Strict Mutually Exclusive Trigger Evaluation
+rsiExitTrigger = (exitMode == "RSI Target") and (rsiVal >= rsiSellLvl)
+emaExitTrigger = (exitMode == "Trailing EMA Target") and ta.crossunder(close, trailEmaVal)
+
+takeProfitCond = (strategy.position_size > 0) and (rsiExitTrigger or emaExitTrigger)
+
+// Track exit type for clear order log visibility
+exitComment = "Take Profit Hit"
+if (strategy.position_size > 0)
+    if rsiExitTrigger
+        exitComment := "RSI " + str.tostring(rsiSellLvl) + " TP"
+    else if emaExitTrigger
+        exitComment := "EMA Trail Crossunder"
+
+// === FTMO Cost Tracking Engine ===
+var float accumulatedFinancingCosts = 0.0
+isNewDay = not na(ta.change(time("D")))
+
+if strategy.position_size > 0 and isNewDay
+    positionValue = math.abs(strategy.position_size) * close
+    isWednesday = (dayofweek == dayofweek.wednesday)
+    swapMultiplier = isWednesday ? 3.0 : 1.0
+    currentSwapCost = positionValue * (dailySwapPct / 100) * swapMultiplier
+    accumulatedFinancingCosts := accumulatedFinancingCosts + currentSwapCost
+
+ftmoNetEquity = strategy.netprofit - accumulatedFinancingCosts
+
+// === Trade Execution (At Close of Candle) ===
+if longCondition
+    strategy.entry("RSI2 Long", strategy.long)
+
+// Take Profit Execution
+if takeProfitCond
+    strategy.close("RSI2 Long", comment=exitComment, immediately=true)
+
+// === Stop Loss Execution ===
+if strategy.position_size > 0
+    stopPrice = strategy.position_avg_price * (1 - (stopLossPct / 100))
+    strategy.exit("Stop Loss", from_entry="RSI2 Long", stop=stopPrice, comment="Cut Loss Target")
+
+// === Performance Display Dashboard ===
+var table costDisplay = table.new(position.top_right, 2, 2, bgcolor=color.new(color.black, 20), border_color=color.black, border_width=1)
+if barstate.islast
+    table.cell(costDisplay, 0, 0, "Total Swap Fees Deducted:", text_color=color.white, text_size=size.small)
+    table.cell(costDisplay, 1, 0, "$" + str.tostring(accumulatedFinancingCosts, "#.##"), text_color=color.red, text_size=size.small)
+    table.cell(costDisplay, 0, 1, "FTMO Adjusted Net Profit:", text_color=color.white, text_size=size.small)
+    table.cell(costDisplay, 1, 1, "$" + str.tostring(ftmoNetEquity, "#.##"), text_color=ftmoNetEquity >= 0 ? color.green : color.red, text_size=size.small)
